@@ -1,499 +1,431 @@
-# Prefix Artifact 统一 Core + SHM 骨架设计
+# Prefix Artifact 统一 Core 骨架设计
 
 日期：2026-09-07
 
-状态：方向 2 骨架设计稿，待评审。依据 [可落地设计 V3](Prefix Execution Artifact Store：可落地设计 V3.md)
-§2/§5/§6/§7/§9/§13 与 [PR Roadmap ZH](Prefix Execution Artifact Store：PR Roadmap ZH.md) 阶段 1，
-并对照 fork 现有 R3 capture baseline 逐行核实后落定。
+状态：**基于 [vllm-project/vllm#45635](https://github.com/vllm-project/vllm/pull/45635) 真实实现校准后的骨架设计**。
+head 分支 `xhx1022/vllm:r3_offload`，head SHA `df09778c`。
+
+> 注：本文件标题里的「SHM」沿用旧命名，但 #45635 的实际落地已把 store 从**跨进程文件 SHM**
+> （`LocalSharedMemoryArtifactStore`，见更早的 aoshen02/vllm#11）改成**单 owner 进程内匿名 mmap arena**
+> （`InProcessArtifactStore`）。真正的 shm / mooncake / kvcc 后端是下一阶段的事，见 §11。
+> 本文是 #45635 的权威基准，**取代**之前基于 aoshen02/vllm#11 的版本（那份的 key 公式、store 语义、
+> 文件布局均已过时）。
 
 ---
 
-## 0. 一句话目标
+## 0. 一句话结论
 
-阶段 1 要建立**一个 field-agnostic 的统一 Artifact Connector**，SHM 是第一个 backend。
-R3 与 logprobs 是两个「field descriptor 配置」，而不是两套 capture/store 代码。
-骨架先把「统一 Core + SHM」立起来，让 R3 先挂上（复用已有 capture baseline），logprobs 按
-[Logprobs 捕获设计 §10](Prefix Artifact Logprobs 捕获设计.md) 的 ingest 接口随后挂上。
+PR #45635 的「统一 Core」是一个**进程内、KV-cache 生命周期对齐**的 artifact 管线：
 
-本文交付：文件/类/接口清单、每个类的职责边界、关键方法签名与伪代码、两条端到端时序、
-以及「R3 与 logprobs 如何收敛到同一个 Core」的证明。
+```text
+scheduler 侧  ArtifactSchedulerConnector   （control plane：增量 block-hash 打包 / emit cursor / generation）
+worker 侧     ArtifactWorkerConnector       （data plane：capture / tail buffer / publish / materialize）
+field 侧      routed_experts.py             （R3 专用 key + buffer + publish + materialize —— 未来 logprobs 镜像）
+backend 侧    store.py                      （opaque bytes + 定长 slot + 匿名 mmap arena + 引用计数）
+```
+
+`RoutedExpertsArtifactBuffer` 从独立 `buffer.py` **并入** `routed_experts.py`；
+`LocalSharedMemoryArtifactStore`（文件 SHM）**删除**，换成 `InProcessArtifactStore`（匿名 mmap）。
+与 aoshen02#11 的 8 处差异见 §8。
 
 ---
 
-## 1. 文件布局（对应 V3 §13）
+## 1. 真实文件布局（head SHA `df09778c` 最终态）
 
 ```text
 vllm/distributed/artifact_connector/
-├── __init__.py
-├── protocol.py      # scheduler/worker IPC dataclasses（挂 SchedulerOutput / ModelRunnerOutput）
-├── fields.py        # FieldDescriptor + R3 / Logprobs 两个 descriptor 实例（唯一 field-specific）
-├── store.py         # ArtifactStore Protocol + factory（opaque bytes，不理解 R3/logprobs）
-├── shm.py           # ShmArtifactStore（/dev/shm + atomic rename + checksum + capacity + TTL）
-├── request_core.py  # ArtifactRequestCore（唯一 request state machine）
-├── connector.py     # ArtifactSchedulerConnector + ArtifactWorkerConnector（编排）
-└── mooncake.py      # S2 阶段再加，本骨架只留 factory 挂点
+├── __init__.py            # 仅 SPDX 头（空）
+├── store.py               # ArtifactObject / ArtifactStoreError / BackgroundArtifactStore / InProcessArtifactStore
+├── connector.py           # PackedBlockHashes / ArtifactConnectorMetadata / ArtifactRequestOutput / ArtifactSchedulerConnector
+├── routed_experts.py      # _RequestTail / RoutedExpertsArtifactBuffer / routed_experts_keys / publish / materialize
+└── worker.py              # _WorkerRequestState / PendingArtifactOutput / ArtifactWorkerConnector
+
+vllm/config/artifact.py    # ArtifactConfig
 ```
 
-与 fork 现状的对应关系：
+**对比 aoshen02#11**：`shm.py`、`buffer.py` 两个文件消失（职责分别并入 `store.py` 与
+`routed_experts.py`）；`store.py` 里不再有 `ArtifactStore` Protocol（只留 `BackgroundArtifactStore`
++ `InProcessArtifactStore`）。
 
-| fork 已有（R3 capture baseline） | 骨架阶段 | 去向 |
-|---|---|---|
-| `RoutedExpertsCapturer`（worker GPU hook） | 保留不动 | 仍负责 GPU 截取 |
-| `RoutedExpertsTensors/Lists`（传输结构） | 保留不动 | 仍负责 D2H 传输 |
-| `AsyncOutput.routed_experts` / `ModelRunnerOutput.routed_experts` | 保留不动 | 数据到达 scheduler 的载体 |
-| `RoutedExpertsManager`（slot buffer） | **新建骨架后逐步被取代** | logical-object 发布取代 physical-slot 直出 |
-| —（缺）`artifact_connector/` | **本次新增** | 统一 Core + SHM |
+集成改动（非新目录，但必须一起看）：
+`vllm/config/vllm.py`（`_verify_artifact_compatibility`）、`vllm/v1/core/sched/output.py`
+（`artifact_connector_metadata` 字段）、`scheduler.py`（构造 + 3 个调用点）、
+`vllm/v1/worker/gpu/model_runner.py`（构造 + begin_step/prepare_output）、
+`vllm/v1/worker/gpu/async_utils.py`（`AsyncOutput` 承载）、
+`vllm/model_executor/layers/fused_moe/routed_experts_capturer.py`（capture 源，本 PR 基本不动）。
 
 ---
 
-## 2. 核心抽象：FieldDescriptor（fields.py）
-
-**这是 R3 与 logprobs 差异的唯二收敛点**（另一个是 `pack_block`）。其余 store/core/connector
-完全 field-agnostic。任何新 token-wise field（DSA、top-p/k ids）只需新增一个 descriptor。
+## 2. store.py —— 定长 slot + 匿名 mmap arena + 引用计数
 
 ```python
-# fields.py
-from dataclasses import dataclass
-from collections.abc import Sequence
-
 @dataclass(frozen=True)
-class FieldDescriptor:
-    field_name: str              # "routed_experts" | "logprobs"
-    logical_coordinate: str      # "EXECUTED_TOKEN" | "PREDICTED_TOKEN"
-    dtype: str                   # "|u1" | "|f4"（numpy dtype 字符串，进 envelope header）
-    shape_per_token: tuple[int, ...]   # R3: (num_layers, topk)；logprobs: (width,)
-    artifact_block_size: int
-    mode: str | None = None      # logprobs 的 "raw"|"processed"；R3 为 None
+class ArtifactObject:
+    key: str
+    payload: bytes
 
-    # ---- 唯一 field-specific 的三个方法 ----
+class ArtifactStoreError(RuntimeError): ...
 
-    def first_valid_token_index(self) -> int:
-        """EXECUTED_TOKEN 从 token 0 起有效；PREDICTED_TOKEN 的 token 0 无前驱。"""
-        return 0 if self.logical_coordinate == "EXECUTED_TOKEN" else 1
+class BackgroundArtifactStore:           # 后台线程序列化 put，读自己写
+    def __init__(self, store: InProcessArtifactStore, *, max_pending_batches: int): ...
+    def put(self, objects, *, retain_keys=(), release_keys=()) -> None: ...  # 入队，coalesced
+    def get_concatenated(self, keys: list[str]) -> bytes: ...                # queue.join() 后读
+    def close(self) -> None: ...
 
-    def pack_block(self, suffix_rows: Sequence[np.ndarray], block_idx: int
-                   ) -> tuple[np.ndarray, int]:
-        """把 logical suffix 的 block_idx 段打包成 payload，返回 (payload, valid_len)。
-
-        首 block 若含 sentinel（logprobs 的 token 0），sentinel 行不进 payload，
-        valid_len 减 1。这是 §5.5 envelope 的 valid_len 唯一来源。
-        """
-        raise NotImplementedError
-
-    def materialize(self, payloads: Sequence[np.ndarray]) -> np.ndarray:
-        """SHM 模式下，把按序读回的 block/tail payload 拼成实际值（base64 npy 的原料）。"""
-        raise NotImplementedError
+class InProcessArtifactStore:            # 单 owner，淘汰后 fail-closed
+    def __init__(self, *, max_bytes: int, object_nbytes: int): ...
+    def put(self, objects, *, retain_keys=(), release_keys=()) -> None: ...
+    def get_concatenated(self, keys: list[str]) -> bytes: ...
+    def close(self) -> None: ...
 ```
 
-### 2.1 R3 descriptor
+要点（**与 aoshen02#11 的 `LocalSharedMemoryArtifactStore` 本质不同**）：
 
-```python
-# fields.py
-R3_FIELD = FieldDescriptor(
-    field_name="routed_experts",
-    logical_coordinate="EXECUTED_TOKEN",
-    dtype="|u1",                      # num_experts <= 256 时 uint8；否则 |u2
-    shape_per_token=(num_layers, topk),
-    artifact_block_size=B,
-    mode=None,
-)
-
-# R3 的 pack_block：EXECUTED_TOKEN，无 sentinel
-#   payload = stack(suffix_rows[lo:hi])          # [B, layers, topk] uint8
-#   valid_len = hi - lo
-```
-
-### 2.2 Logprobs descriptor（复用方向 1 的 §10.5）
-
-```python
-# fields.py
-LOGPROBS_FIELD = FieldDescriptor(
-    field_name="logprobs",
-    logical_coordinate="PREDICTED_TOKEN",
-    dtype="|f4",
-    shape_per_token=(width,),          # 1（默认）或 1+k
-    artifact_block_size=B,
-    mode=raw_or_processed,             # 参与 content key，raw/processed 不得混用
-)
-
-# logprobs 的 pack_block：PREDICTED_TOKEN，首 block 去掉 token 0 sentinel
-#   payload = stack(suffix_rows[lo:hi])          # [hi-lo, width]
-#   if block_idx == 0: payload = payload[1:]; valid_len -= 1
-```
-
-**关键性质**：`pack_block` 是唯一知道「首 block 有 sentinel」的地方；`derive_full_block_key`
-(§5.3) 对两个 field 完全一样，因为 key 只依赖 `field_name` + `dtype` + `shape_per_token` +
-`mode` + `artifact_block_size` + `kv_block_hash`，不依赖 `logical_coordinate`。
+- **匿名 mmap，非文件**：`self._arena = mmap.mmap(-1, num_slots * object_nbytes)`——进程内匿名映射，
+  无 `arena.bin` 文件、无 `flock` writer lock、无 `make_shm_store_id(instance_id, dp_rank)`、无 stale GC。
+  store 是**单 owner、单进程**的。
+- **定长 slot 化**：`object_nbytes` 在构造时固定（= 一个 hash block 的 R3 数据字节数），
+  `num_slots = max_bytes // object_nbytes`；`_lru: OrderedDict[str, int]` 记 key→slot
+  （`_UNALLOCATED_SLOT = -1` 表示已登记未落盘），`_free_slots` 回收空闲 slot，`_next_slot` 顺序分配。
+- **引用计数对齐 KV cache 生命周期**（commit `22d5ec7`「Align artifact lifetime with KV cache」）：
+  `_references: dict[str, int]` + `_retain(key)`/`_release(key)`；`_release` 返回
+  `terminal_order`（引用归零的 key，移到 LRU 最尾成为下一轮淘汰候选）。这取代了 aoshen02#11 的
+  TTL stale GC——artifact 的存活直接绑定到「还有多少 KV block 引用它」。
+- **淘汰**：`_evict_to_fit(protected)` 只淘汰「无引用且不在 protected 集合」的最旧对象；
+  凑不够就 `raise ArtifactStoreError`（fail-closed）。
+- **幂等**：`put` 内 `unique = {obj.key: obj}` 去重，已落盘 key 只 `move_to_end`（touch）不重写；
+  未落盘（`_UNALLOCATED_SLOT`）才 `_allocate_slot` + 写 `arena[offset:offset+object_nbytes] = payload`。
+- **读**：`get_concatenated(keys)` 把多个 key 的 slot 拼接成一段 bytes（`b"".join(...)`），
+  读不到抛 `ArtifactStoreError`（提示增大 `max_bytes`），读后 `move_to_end` touch。
+- **后台线程**：`BackgroundArtifactStore` 用 daemon 线程 `"vllm-artifact-writer"` + `queue.Queue`，
+  把 `(objects, retain_keys, release_keys)` 三元素 batch 序列化到 store；`get_concatenated` 先
+  `queue.join()` 保证「读自己刚发的写」；`_error` 记录首次失败、后续 `put/get` 经
+  `_raise_if_failed` fail-closed。
 
 ---
 
-## 3. Store 契约（store.py）
-
-Store 只处理 **opaque bytes + envelope header**，不解析 R3/logprobs。
+## 3. connector.py —— scheduler 控制面
 
 ```python
-# store.py
-from typing import Protocol
-
-class ArtifactStore(Protocol):
-    def put(self, key: str, envelope: bytes) -> bool:
-        """幂等发布。已存在返回 False（调用方据此判断 skip put）。"""
-        ...
-
-    def exists(self, key: str) -> bool:
-        """prefix admission 的存在性查询。"""
-        ...
-
-    def get(self, keys: list[str]) -> list[bytes]:
-        """按序取回。逐 object 校验 envelope 的 payload_sha256，坏则 raise。"""
-        ...
-
-    def delete(self, keys: list[str]) -> None:
-        """GC / capacity 淘汰用。"""
-        ...
-
-
-def create_store(config: ArtifactConfig) -> ArtifactStore:
-    """factory：SHM 或 Mooncake。S2 之前 Mooncake 分支 raise NotImplemented。"""
-    if config.backend == "shm":
-        from .shm import ShmArtifactStore
-        return ShmArtifactStore(config)
-    raise NotImplementedError(config.backend)
-```
-
-### 3.1 envelope 编解码（request_core 提供，store 只存 bytes）
-
-```text
-uint32 header_length | canonical JSON header | raw contiguous tensor bytes
-```
-
-```json
-{"schema_version":1,"kind":"block|tail","field":"routed_experts|logprobs","object_id":"…",
- "dtype":"|u1| |f4","shape":[16,32,8],"valid_len":16,"payload_sha256":"…","header_sha256":"…"}
-```
-
-store 不生成 header；`put(key, envelope)` 里 envelope 已由 request_core 组装好。store 的
-`get` 只做 `payload_sha256` 校验（防 `/dev/shm` 损坏/半写），不解释 `field`/`shape`。
-
----
-
-## 4. SHM backend（shm.py）
-
-对应 V3 §9 的六项能力：trusted namespace、content-addressed、atomic 发布、checksum、
-capacity limit、TTL/lease cleanup。
-
-```python
-# shm.py
-class ShmArtifactStore:
-    def __init__(self, config: ArtifactConfig) -> None:
-        self.root = Path(config.shm_root or "/dev/shm/vllm-artifact")
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.capacity_bytes = config.shm_capacity_bytes
-        self.ttl_seconds = config.shm_ttl_seconds
-
-    def _path(self, key: str) -> Path:
-        # key 本身已是 content hash；文件名用 sha256(key) 防路径注入/超长
-        return self.root / hashlib.sha256(key.encode()).hexdigest()
-
-    def put(self, key: str, envelope: bytes) -> bool:
-        path = self._path(key)
-        if path.exists():
-            return False                       # 幂等：immutable，已存在即完成
-        tmp = path.with_suffix(".tmp")
-        tmp.write_bytes(envelope)
-        tmp.rename(path)                       # atomic publish（同目录 rename）
-        self._maybe_evict()                    # capacity 超限时淘汰最旧 / 过 TTL
-        return True
-
-    def exists(self, key: str) -> bool:
-        return self._path(key).exists()
-
-    def get(self, keys: list[str]) -> list[bytes]:
-        out = []
-        for key in keys:
-            raw = self._path(key).read_bytes()
-            out.append(self._verify_and_strip(raw))   # payload_sha256 校验
-        return out
-
-    def delete(self, keys: list[str]) -> None:
-        for key in keys:
-            self._path(key).unlink(missing_ok=True)
-```
-
-要点：
-
-- **atomic**：同目录 `tmp` 写满 `rename`，读者永远看不到半写对象；
-- **幂等**：`put` 对已存在 key 直接 `False`，对应 V3 §7.1「backend 对已存在 immutable key 跳过 put」；
-- **`put` 返回 True 才算 publish 成功**：SHM 是同步 publish 后 ACK（V3 §7.4）；
-- **capacity/TTL**：`_maybe_evict` 用 `mtime` + `ttl`，先淘汰过期，再淘汰最旧，不逐 object 加锁。
-
----
-
-## 5. Request Core（request_core.py）
-
-V3 §6 已定边界：只持有不可变依赖，负责 key/coverage/envelope/ordered refs/tail/materialize，
-不碰 GPU capture、scheduler admission、HTTP、Mooncake lifecycle。
-
-```python
-# request_core.py
-@dataclass(frozen=True)
-class FinalizeResult:
-    artifact_keys: list[str]          # ordered full-block keys + tail key（Mooncake 返回）
-    materialized: np.ndarray | None   # SHM 模式下 materialize 出的实际值
-    block_write_count: int            # 本次实际 put 的 object 数（记账用）
-
-
-class ArtifactRequestCore:
-    def __init__(self, store: ArtifactStore, field: FieldDescriptor,
-                 materialize: bool, model_namespace: str) -> None:
-        self.store = store
-        self.field = field
-        self.materialize_mode = materialize      # SHM=True 读回组装；Mooncake=False 返回 keys
-        self.model_namespace = model_namespace
-
-    # ---- key 派生（§5.3 / §5.4）----
-
-    def derive_full_block_key(self, kv_block_hash: str) -> str:
-        return hash_key(
-            schema_version=1,
-            model_namespace=self.model_namespace,
-            field=self.field.field_name,
-            dtype=self.field.dtype,
-            shape_per_token=self.field.shape_per_token,
-            artifact_block_size=self.field.artifact_block_size,
-            kv_block_hash=kv_block_hash,
-            # logprobs 额外并入 self.field.mode；R3 为 None 不参与
-        )
-
-    def derive_tail_key(self, request_id: str, attempt_id: str,
-                        terminal_boundary: int) -> str:
-        return hash_key(
-            schema_version=1, model_namespace=self.model_namespace,
-            field_profile_id=self.field.field_name,   # 或 field 的 profile id
-            request_id=request_id, request_attempt_id=attempt_id,
-            terminal_executed_boundary=terminal_boundary,
-        )
-
-    # ---- 发布 ----
-
-    def commit_full_blocks(self, suffix: LogicalSuffix,
-                           kv_block_hashes: Sequence[str],
-                           executed_len: int) -> list[str]:
-        """只发布新完成的 full block（V3 §7.1）。"""
-        B = self.field.artifact_block_size
-        keys = []
-        for k in range(executed_len // B):            # 只到已完成整块
-            payload, valid_len = self.field.pack_block(suffix.rows, k)
-            key = self.derive_full_block_key(kv_block_hashes[k])
-            envelope = self._encode(payload, valid_len, key, kind="block")
-            if self.store.put(key, envelope):         # 幂等，重复 key 跳过
-                self._account_write()
-            keys.append(key)
-        return keys
-
-    def finalize(self, suffix: LogicalSuffix, kv_block_hashes: Sequence[str],
-                 executed_len: int, request_id: str, attempt_id: str
-                 ) -> FinalizeResult:
-        """V3 §7.2：从 KV hashes 确定性派生 ordered keys，tail 单独 put。"""
-        B = self.field.artifact_block_size
-        num_full = executed_len // B
-        has_tail = (executed_len % B) != 0
-
-        full_keys = self.commit_full_blocks(suffix, kv_block_hashes, executed_len)
-
-        tail_key = None
-        if has_tail:
-            tail_payload, tail_len = self.field.pack_block(suffix.rows, num_full)
-            tail_key = self.derive_tail_key(request_id, attempt_id, executed_len)
-            self.store.put(tail_key, self._encode(tail_payload, tail_len,
-                                                  tail_key, kind="tail"))
-
-        ordered = full_keys + ([tail_key] if tail_key else [])   # 顺序即 token 顺序
-        materialized = None
-        if self.materialize_mode:
-            materialized = self._materialize(ordered)
-        return FinalizeResult(ordered, materialized, len(ordered))
-
-    def _materialize(self, ordered_keys: list[str]) -> np.ndarray:
-        payloads = [self._decode(self.store.get([k])[0]) for k in ordered_keys]
-        return self.field.materialize(payloads)      # field-specific 拼接
-```
-
-**为什么 key 派生放 core 而不是 scheduler**：V3 §7.2「full-block key 从 KV hashes 确定性派生」，
-`kv_block_hash` 由 scheduler 提供（KVCacheManager），但 hash 组合与 field profile 绑定，放 core
-保持单一事实源；scheduler 只做 admission / existence / commit plan / finalize 触发。
-
----
-
-## 6. Connector 编排（connector.py）+ IPC（protocol.py）
-
-### 6.1 protocol.py —— 挂在既有 SchedulerOutput / ModelRunnerOutput 上
-
-```python
-# protocol.py
 @dataclass
-class ArtifactConnectorMetadata:
-    """scheduler -> worker 下发（随 SchedulerOutput）。"""
-    executed_len: int                      # authoritative executed boundary（stop/acceptance 后）
-    kv_block_hashes: list[str]             # 已分配 KV block 的 content hash（顺序即 token 顺序）
-    commit_blocks: list[int]               # 本次要 commit 的 full block index（增量）
-    finalize: bool                         # 是否触发 finalize
-    request_id: str
-    attempt_id: str
+class PackedBlockHashes:            # 连续 bytes 打包，跨 scheduler/worker IPC
+    data: bytes
+    item_size: int
+    def __iter__(self) -> Iterator[bytes]: ...   # 按 item_size 切片
 
 @dataclass
-class ArtifactConnectorAck:
-    """worker -> scheduler 上返（随 ModelRunnerOutput）。"""
-    request_id: str
-    status: Literal["ok", "fail"]
-    block_write_count: int
-```
+class ArtifactConnectorMetadata:    # scheduler -> worker（挂 SchedulerOutput）
+    generation: int
+    requests: dict[str, int]                    # request_id -> emit_start
+    block_hashes: dict[str, PackedBlockHashes]  # 增量新增 hash
+    finished_requests: tuple[str, ...]          # 本步终止的 request_id
 
-### 6.2 ArtifactSchedulerConnector
+@dataclass
+class ArtifactRequestOutput:
+    token_start: int
+    rows: np.ndarray
 
-```python
-# connector.py —— scheduler 侧
 class ArtifactSchedulerConnector:
-    def __init__(self, store: ArtifactStore, field: FieldDescriptor): ...
-
-    def before_step(self, requests) -> None:
-        # 为每个 request 维护 accepted/executed progress，标记新完成的 full block
-        ...
-
-    def build_metadata(self, req) -> ArtifactConnectorMetadata:
-        # executed boundary = stop-trim / spec acceptance 之后的值（不能含 in-flight 行）
-        # kv_block_hashes 来自 KVCacheManager
-        ...
-
-    def on_ack(self, ack: ArtifactConnectorAck) -> None:
-        # 记录每个 object 的独立记账；fail 不把同 batch 其它 item 误标 ready（V3 §7.1）
-        ...
+    def __init__(self) -> None: ...             # _sent_hash_counts / _finished_requests / _generation
+    def build_connector_meta(self, scheduler_output, requests) -> ArtifactConnectorMetadata: ...
+    def take_output(self, request, output) -> np.ndarray | None: ...
+    def request_finished(self, request) -> None: ...
+    def reset(self) -> None: ...
+    @staticmethod
+    def _pack_new_hashes(block_hashes, num_sent) -> PackedBlockHashes | None: ...
 ```
 
-### 6.3 ArtifactWorkerConnector
+关键行为（**与 aoshen02#11 的差异**：`requests` 从 `list[ArtifactRequestMetadata]` 精简为
+`dict[str, int]`，`finished_requests` 从 `dict` 精简为 `tuple[str, ...]`）：
+
+- **emit_start 语义**（`build_connector_meta` 内）：
+  ```python
+  scheduled_requests[request_id] = max(
+      request.sampling_params.routed_experts_prompt_start,
+      0 if request.num_output_tokens == 0 else request.num_tokens - 1,
+  )
+  ```
+  即「R3 从 `routed_experts_prompt_start`（默认 0）开始 emit，直到最后一个已生成 token」。
+- **增量 hash 打包**：`_pack_new_hashes` 只发 `block_hashes[num_sent:]` 的新增段（`_sent_hash_counts`
+  记录每 request 已发数量），避免每 step 重传全部 hash；已 settle 但未重调度的 request 会补发
+  hash-only 更新（见 `build_connector_meta` 第二段）。
+- **termination**：`request_finished` 把 terminal 事件 + 最终新增 hash 塞进 `_finished_requests`，
+  下一次 `build_connector_meta` 时作为 `finished_requests` 元组转交给 worker。
+- **generation**：`reset()` 清空 `_sent_hash_counts`/`_finished_requests` 并 `_generation += 1`；
+  worker 见 generation 变化即清空本地状态（reset invalidation 的控制面实现）。
+- **不持 payload、不持 store**：`ArtifactSchedulerConnector.__init__` 无参，纯游标 + hash 记账。
+
+---
+
+## 4. routed_experts.py —— R3 field 模块 + tail buffer + 明文 key
+
+### 4.1 key 公式（**明文，不再 sha256**）
 
 ```python
-# connector.py —— worker 侧
+def routed_experts_keys(block_hashes, artifact_namespace) -> list[str]:
+    prefix = f"vllm-artifact/{artifact_namespace}/"
+    return [prefix + block_hash.hex() for block_hash in block_hashes]
+```
+
+`artifact_namespace = str(generation)`。key 是 `vllm-artifact/{generation}/{block_hash.hex()}`，
+**直接拼接十六进制 block_hash，无哈希、无 field/dtype/shape**。这是与 aoshen02#11
+（`sha256(generation + "\0" + block_hash)`）最直观的差异：更简单，但**更暴露 field 冲突风险**
+（见 §9）。
+
+### 4.2 publish / materialize（无 JSON envelope）
+
+```python
+def materialize_routed_experts(store, artifact_keys, *, shape_per_token, dtype) -> np.ndarray:
+    payload = store.get_concatenated(artifact_keys)
+    return np.frombuffer(payload, dtype=dtype).reshape((-1, *shape_per_token))
+
+def publish_routed_experts(store, *, batches, block_size, retain_keys=(), release_keys=()) -> None:
+    objects = []
+    for artifact_keys, blocks in batches:
+        for block_start, array in blocks:
+            # 校验：block_start 对齐 block_size；block_index < len(keys)；len(array)==block_size
+            objects.append(ArtifactObject(
+                key=artifact_keys[block_start // block_size],
+                payload=array.tobytes(order="C"),
+            ))
+    store.put(objects, retain_keys=retain_keys, release_keys=release_keys)
+```
+
+payload 是 `array.tobytes(order="C")` 的 raw bytes，**无 header**；shape/dtype 由调用方（worker）传入，
+materialize 只靠 `get_concatenated` 的字节数 + `reshape((-1, *shape_per_token))` 做隐式校验。
+
+### 4.3 RoutedExpertsArtifactBuffer（从旧 `buffer.py` 迁入）
+
+`RoutedExpertsArtifactBuffer(dtype, shape_per_token, block_size, max_num_seqs, max_num_batched_tokens, max_concurrent_batches)`：
+
+- `_rows: np.ndarray[(max_blocks, block_size, *shape_per_token)]` 的 numpy 预分配池，
+  `max_blocks = max_concurrent_batches * ceil(max_num_batched_tokens/block_size) + max_num_seqs`；
+  `_free_slots` / `_owned_slots` / `_requests: dict[Hashable, _RequestTail]` 管理 slot 生命周期。
+- `capture(request_id, token_start, rows) -> list[(block_start, block)]`：把 rows 追加进 tail，
+  凑满 `block_size` 即产出完整 block；**全对齐输入块**（`local_start==0 and len>=block_size`）不占
+  tail pool 直接产出。
+- `read` / `retain_block`（无 key 的 pending block 保留到下一次 hash 更新）/ `release_block` /
+  `discard` / `reset`。
+- **已参数化 dtype/shape_per_token**：类名带 R3，但本质是通用 tail buffer，logprobs 复用只需改名
+  `ArtifactBuffer`（见 §9）。
+
+---
+
+## 5. worker.py —— worker 数据面
+
+```python
+@dataclass
+class _WorkerRequestState:
+    artifact_keys: list[str]                 # 已 keyed（有 hash）的 block key 序列
+    pending_blocks: list[tuple[int, np.ndarray]]  # 无 key、待 hash 更新的完整 block
+    capture_cursor: int | None
+    scheduled_cursor: int
+    emit_cursor: int
+
+@dataclass
+class PendingArtifactOutput:
+    connector: ArtifactWorkerConnector
+    token_starts: np.ndarray
+    query_start_loc: np.ndarray
+    routed_experts: torch.Tensor
+    finished: Event
+    def complete(self) -> None: ...          # connector._pending_output = None; finished.set()
+
 class ArtifactWorkerConnector:
-    def __init__(self, field: FieldDescriptor): ...
-
-    def ingest_step(self, req_state, rows: list[np.ndarray | None], token_start: int):
-        """把本 step accepted rows 追加进 uncommitted per-request logical suffix。
-
-        rows 的来源：
-          - R3: ModelRunnerOutput.routed_experts 按 slot_mapping 重建 logical rows
-          - logprobs: Logprobs 捕获设计 §10.2 按 cu_num_generated_tokens 切出的 rows
-        token_start 是 rows[0] 对应的绝对 token index（scheduler metadata 提供）。
-        """
-        req_state.suffix.append_step(self.field, rows, token_start)
-
-    def commit(self, req_state, metadata) -> ArtifactConnectorAck:
-        core = req_state.core                       # ArtifactRequestCore
-        keys = core.commit_full_blocks(req_state.suffix,
-                                       metadata.kv_block_hashes,
-                                       metadata.executed_len)
-        return ArtifactConnectorAck(req_state.request_id, "ok", len(keys))
-
-    def finalize(self, req_state, metadata) -> ArtifactConnectorAck:
-        result = req_state.core.finalize(req_state.suffix,
-                                         metadata.kv_block_hashes,
-                                         metadata.executed_len,
-                                         metadata.request_id, metadata.attempt_id)
-        req_state.artifact_keys = result.artifact_keys   # scheduler 校验后组装 HTTP
-        return ArtifactConnectorAck(req_state.request_id, "ok",
-                                    result.block_write_count)
+    def __init__(self, *, vllm_config, model, kv_cache_config, max_num_batched_tokens): ...
+    def prepare_output(self, request_ids, token_starts, query_start_loc) -> PendingArtifactOutput | None: ...
+    def process_output(self, request_ids, token_starts, query_start_loc, routed_experts,
+                       num_sampled, num_rejected) -> dict[str, ArtifactRequestOutput]: ...
+    def begin_step(self, metadata) -> None: ...
+    def close(self) -> None: ...
 ```
 
-### 6.4 LogicalSuffix —— worker 侧 uncommitted 区（field-agnostic 包装）
+关键设计：
+
+- **TP 对称**：`__init__` 无条件 `RoutedExpertsCapturer` + `bind_routed_experts_capturer`（所有 TP rank
+  参与 capture collective），但 `if not get_tp_group().is_first_rank: return`——只有 TP output rank
+  建 store/buffer 持有 data plane。
+- **block 粒度拆分**（`__init__`）：`scheduler_block_size, hash_block_size =
+  resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)`；`hashes_per_kv_block =
+  scheduler_block_size // hash_block_size`；`block_nbytes = hash_block_size * prod(shape_per_token) *
+  dtype.itemsize`。store 的 `object_nbytes` 以 **hash block** 为粒度（一个 hash 对应一段 R3 rows），
+  `max_bytes` 缺省 = `kv_cache_config.num_blocks * hashes_per_kv_block * block_nbytes`（与 KV cache
+  同容量）。
+- **capture 源**：`prepare_output` 调 `self._capturer.snapshot_routing_data(num_rows)` 拿到**稳定 GPU
+  snapshot**（`device_buffer[:num_rows].to(output_dtype)`），交给 `AsyncOutput` 在 copy stream 上做
+  异步 D2H。
+- **process_output 主流程**：按 `query_start_loc` 切 rows → `rows = routed_experts[start:end-rejected]`
+  （spec reject 截断）→ 处理 capture/emit/scheduled 三个 cursor（含「乐观调度的后缀被拒后重贴」分支）
+  → `buffer.capture` → `_publish_blocks`（keyed 的 ready 直接 publish，无 key 的进 `pending_blocks`
+  retain 等下一次 hash 更新）→ materialize `[emit_start, token_end)` 组装 `ArtifactRequestOutput`。
+- **generation 检测**：`begin_step` 见 `metadata.generation > self._generation` 即 release 全部旧 key、
+  `buffer.reset()`、`_requests.clear()`——reset invalidation 的 worker 侧实现。
+
+---
+
+## 6. config/artifact.py + 兼容性校验
 
 ```python
-# request_core.py（或 connector.py）
-class LogicalSuffix:
-    """per-request、按绝对 token index 排列的 uncommitted 区（V3 §2.2/§3）。
-
-    rows[j] = token t_j 的字段行；R3 从 j=0 起有效，logprobs 的 j=0 恒为 sentinel。
-    """
-    def __init__(self, field: FieldDescriptor) -> None:
-        self.field = field
-        self.rows: list[np.ndarray | None] = [None] * field.first_valid_token_index()
-        # R3: [] 空起点；logprobs: [None]（token 0 sentinel）
-
-    def append_step(self, field, step_rows, token_start):
-        for offset, row in enumerate(step_rows):
-            if row is None:
-                continue
-            j = token_start + offset
-            while len(self.rows) <= j:
-                self.rows.append(None)
-            self.rows[j] = row
+@config
+class ArtifactConfig:
+    enable_return_routed_experts: bool = False
+    max_bytes: int | None = Field(default=None, gt=0)   # None -> 由 KV cache 容量推导
+    @property
+    def enabled(self) -> bool: return self.enable_return_routed_experts
+    def compute_hash(self) -> str: ...
 ```
+
+`VllmConfig._verify_artifact_compatibility`（`vllm/config/vllm.py`）在 `enabled` 时强制：
+
+- 必须：Model Runner V2（`use_v2_model_runner`）、`runner_type == "generate"`、`is_moe`、
+  prefix caching 开启；
+- 禁止：adaptive speculative verification、PP > 1、DCP/PCP > 1、KV connectors（PD 分离 / KV offload）。
+
+> logprobs 接入时注意：`is_moe` 这个 gate 对 logprobs 是**错的**（logprobs 适用于任意模型），见 §9.4。
 
 ---
 
-## 7. 两条端到端时序
+## 7. 端到端数据流（PR #45635 实际时序）
 
-### 7.1 commit（full block 增量，V3 §7.1）
+### 7.1 scheduler 控制面
 
 ```text
-forward 完成，capture D2H 到达 scheduler
-  → ArtifactSchedulerConnector.before_step 计算新完成 full block 增量
-  → SchedulerOutput 携带 ArtifactConnectorMetadata(commit_blocks=[k..], finalize=False)
-  → worker ArtifactWorkerConnector.ingest_step 把 rows 追加进 suffix
-  → worker commit → ArtifactRequestCore.commit_full_blocks
-  → ShmArtifactStore.put(key, envelope) 幂等（重复 key 跳过）
-  → ArtifactConnectorAck(ok, block_write_count) 上返
-  → scheduler 独立记账；一个 object 失败不误标同 batch 其它 ready
+scheduler.__init__:  artifact_connector = ArtifactSchedulerConnector() if artifact_config.enabled else None
+scheduler.schedule:  scheduler_output.artifact_connector_metadata = build_connector_meta(output, self.requests)
+                     （增量打包 hash + 计算 emit_start + 转交 finished_requests）
+scheduler._preempt_request: artifact_connector.request_finished(request)   # 释放前先记账
+scheduler.update_from_output: routed_experts = artifact_connector.take_output(request, output)
+                     （从 ArtifactRequestOutput 切 [emit_start, token_end)）
 ```
 
-### 7.2 finalize（V3 §7.2）
+### 7.2 worker 数据面
 
 ```text
-scheduler 得到 stop/abort/spec acceptance 的 authoritative executed end
-  → ArtifactConnectorMetadata(finalize=True, executed_len, kv_block_hashes)
-  → worker finalize → ArtifactRequestCore.finalize
-      ├─ full keys 从 kv_block_hashes 确定性派生并幂等 put
-      ├─ 有 partial tail → derive_tail_key + put（request-scoped，不进入 prefix lookup）
-      └─ SHM: materialize actual R3 / logprobs；Mooncake: 返回 ordered keys
-  → worker 返回 finalize ACK
-  → scheduler 校验后生成 ordered list[artifact_key]（或 SHM 直接带实际值）
-  → 释放暂存 terminal HTTP output
+model_runner.init_artifact_connector(kv_cache_config):
+    artifact_connector = ArtifactWorkerConnector(model, kv_cache_config, max_num_tokens, vllm_config)
+model_runner.execute_model:
+    artifact_connector.begin_step(scheduler_output.artifact_connector_metadata)  # forward 前
+    ...（GPU forward，capturer 在各 MoE layer 内 capture topk_ids 到 device_buffer）
+model_runner.sample_tokens:
+    pending = artifact_connector.prepare_output(req_ids, num_computed_tokens_np, query_start_loc_np)
+    AsyncOutput(..., pending_artifact_output=pending)
+AsyncOutput.__init__:
+    with stream(copy_stream, main_stream):
+        routed_experts = async_copy_to_np(pending.routed_experts)      # 异步 D2H
+        num_rejected   = async_copy_to_np(sampler_output.num_rejected)
+AsyncOutput.get_output:
+    artifact_connector_output = pending.connector.process_output(
+        req_ids, token_starts, query_start_loc, routed_experts,
+        num_sampled_tokens_np, num_rejected)                          # 提交 + materialize
+    pending.complete()                                                # finally 保证不卡死
+    model_runner_output.artifact_connector_output = artifact_connector_output
 ```
 
----
-
-## 8. R3 与 logprobs 的收敛证明（这是统一性的核心验收）
-
-| 关注点 | R3 | Logprobs | 统一 Core 处理 |
-|---|---|---|---|
-| capture | GPU hook 截 topk_ids | sampler 既有输出 | connector.ingest_step 统一入口 |
-| 坐标 | EXECUTED_TOKEN | PREDICTED_TOKEN | `FieldDescriptor.first_valid_token_index` |
-| 首 token sentinel | 无 | 有（token 0） | `FieldDescriptor.pack_block` 首 block 处理 |
-| dtype / shape | `|u1` `[layers,topk]` | `|f4` `[width]` | `FieldDescriptor` 字段 + envelope header |
-| key 公式 | `field=routed_experts` | `field=logprobs`+`mode` | `derive_full_block_key` 复用同一 hash_key |
-| 发布 | full-block put | full-block put | `ArtifactRequestCore.commit_full_blocks` |
-| materialize | 拼 topk_ids | 拼 logprob 值 | `FieldDescriptor.materialize` |
-
-**新增一个 token-wise field 的代价 = 写一个 FieldDescriptor（3 个方法）+ 一个 ingest 来源，
-不动 store / core / connector 任何一行。**
+数据平面流转：`RoutedExpertsCapturer.device_buffer (GPU int32)` → `snapshot_routing_data` 窄化为
+`uint8/uint16` → `AsyncOutput` 异步 D2H 成 numpy → `process_output` 切分/截断 → `buffer.capture`
+凑满 block → `publish_routed_experts`（`array.tobytes` → `BackgroundArtifactStore.put` 入队）→
+后台线程写 `InProcessArtifactStore` 匿名 mmap → `materialize_routed_experts` 读回组装 consumer output。
 
 ---
 
-## 9. 骨架的验收清单（对应 Roadmap 阶段 1）
+## 8. 差异清单：aoshen02#11 → #45635（本次校准核心）
 
-- [ ] `ShmArtifactStore.put/exists/get/delete` 单测：幂等、atomic（并发读无半写）、checksum 坏则 raise；
-- [ ] `ArtifactRequestCore.derive_full_block_key` 对 R3 与 logprobs 同 `kv_block_hash` 得到同 hash 键前缀差异仅 `field`；
-- [ ] R3 端到端：capture → suffix → core → SHM → materialize，与 `RoutedExpertsManager` slot 直出结果逐元素一致；
-- [ ] prefix cache 命中：同 `kv_block_hash` 的 R3 full-block 跨 request 复用（存在性查询命中即 skip put）；
-- [ ] logprobs（方向 1 §10 ingest）挂上后：首 block sentinel 不进 payload、`valid_len` 正确、materialize 值与 sampler 原始输出一致；
-- [ ] finalize 时 ordered key list 长度 = `ceil(executed_len / B)`，tail 单独 request-scoped；
-- [ ] abort/preemption：已提交 full block 保留，未提交 suffix 丢弃，不产生 tail key；
-- [ ] 关闭 artifact 开关时零开销（R3 既有 capture 路径不受影响）。
+| 维度 | aoshen02#11（旧文档基准，已过时） | #45635（权威） |
+|---|---|---|
+| key 公式 | `vllm-artifact/sha256(generation+"\0"+block_hash)` | `vllm-artifact/{generation}/{block_hash.hex()}`（**明文 hex，无哈希**） |
+| store | `LocalSharedMemoryArtifactStore`（文件 arena.bin + flock + TTL GC + 多进程） | `InProcessArtifactStore`（**匿名 mmap** + 单 owner + 引用计数，无 flock/GC） |
+| `shm.py` / `buffer.py` | 独立文件 | **删除**，职责并入 `store.py` / `routed_experts.py` |
+| 读接口 | `get(keys) -> list[bytes]` | `get_concatenated(keys) -> bytes` |
+| 对象尺寸 | 变长（逐 object payload） | **定长 slot**（`object_nbytes` = 一个 hash block） |
+| 生命周期 | TTL stale GC | **引用计数**（`_references` / `retain` / `release`）对齐 KV cache |
+| metadata | `requests: list[ArtifactRequestMetadata]`、`finished_requests: dict`、带 `block_size` | `requests: dict[str,int]`、`finished_requests: tuple[str,...]`、无 `block_size` |
+| block 粒度 | 单一 `block_size` | `scheduler_block_size` vs `hash_block_size`（`resolve_kv_cache_block_sizes`） |
+| ArtifactConfig | `enable_return_routed_experts` + `shm_dir` + `max_shm_bytes` + `shm_ttl_seconds` | `enable_return_routed_experts` + `max_bytes` 两项 |
+
+**结论**：commit `f6406bd`「remove unused store abstractions」删掉了尚未使用的 SHM/Protocol 抽象，
+`22d5ec7`「Align artifact lifetime with KV cache」把「外部 TTL GC」换成「KV block 引用计数」。
+方向从「独立跨进程共享存储」收敛为「**跟随 KV cache 存活周期的进程内 artifact 缓存**」，为后续
+shm/mooncake/kvcc 多后端留了 `store.py` 这个唯一挂点，但**当前只有 `InProcessArtifactStore` 一个实现**。
 
 ---
 
-## 10. 遗留（转后续 PR，骨架阶段不解决）
+## 9. logprobs 接入路径（基于 #45635 真实结构）
 
-- Mooncake backend（S2）：`mooncake.py` 只留 factory 挂点，`create_store` 抛 `NotImplementedError`；
-- multi-rank writer：单 writer 正确性之后按 token/layer logical ranges 并行（见 [Multi-rank Writer 拓扑](Prefix Artifact Multi-rank Writer 拓扑.md)）；
-- `RoutedExpertsManager` 的退役：骨架立起后，R3 从 slot-buffer 直出迁到 logical-object 发布，slot buffer 仅作为 capture 阶段的中间态保留；
-- DSA / top-p/k ids 两个 field descriptor：等各自 capture 稳定后按 §8 追加。
+PR #45635 之后，logprobs 接入仍「不重新发明统一 Core」，但有**三处比 aoshen02#11 时代更硬的结构约束**：
+
+### 9.1 key 冲突（明文 key 下更尖锐）
+
+`routed_experts_keys` 是 `vllm-artifact/{generation}/{block_hash.hex()}`，**不含 field 维度**。
+logprobs 与 R3 共用同一 `block_hash`（同一个 KV prefix block）时，key 必然撞。接入时必须：
+
+```python
+def logprobs_keys(block_hashes, artifact_namespace) -> list[str]:
+    prefix = f"vllm-artifact/{artifact_namespace}/logprobs/"   # 加 field 段
+    return [prefix + block_hash.hex() for block_hash in block_hashes]
+```
+
+（或 `f"vllm-artifact/logprobs/{artifact_namespace}/"`，任选其一，但**必须**与 R3 前缀区分。）
+
+### 9.2 store 定长 slot → 每 field 一个 store（关键新约束）
+
+`InProcessArtifactStore(max_bytes, object_nbytes)` 的 `object_nbytes` 是**构造时固定**的：
+- R3：`hash_block_size * num_layers * num_experts_per_tok * sizeof(uint8|uint16)`
+- logprobs：`hash_block_size * width * sizeof(float32)`（width 由 `sampling_params.logprobs` 决定）
+
+两者尺寸不同，**同一个定长 store 装不下两种 object**。因此 worker 不能只持一个 `self._store`，需改为
+**每 field 一个 store**（`self._r3_store` / `self._logprobs_store`），或把 store 泛化为「按 field 分槽」
+的 `dict[str, InProcessArtifactStore]`。这是 #45635 时代 logprobs 接入的**第一道结构性改动**，
+比 aoshen02#11 时代的「只加 field 到 key」更重。
+
+### 9.3 buffer 已泛化，capture 源切换
+
+`RoutedExpertsArtifactBuffer` 已参数化 `dtype`/`shape_per_token`，改名 `ArtifactBuffer` 即可复用给
+logprobs 的 tail staging（全对齐块直出 / tail 凑 block 逻辑不变）。capture 源从
+`capturer.snapshot_routing_data`（GPU 端 `topk_ids` 窄化）换成
+`sampler_output.logprobs_tensors`（方向 1 §10 的 `ingest_logprobs` 落点），在 `prepare_output` 里
+snapshot、在 `process_output` 里复用 `num_sampled`/`num_rejected` 边界处理。
+
+### 9.4 兼容性 gate 需放宽
+
+`_verify_artifact_compatibility` 的 `is_moe` 检查对 logprobs **不成立**（logprobs 任意模型都可用）。
+接入 logprobs 时要改成：R3 要求 `is_moe`，logprobs 不要求；`bind_routed_experts_capturer`（必须找到
+MoE router，否则 raise）也要在非 MoE + 仅 logprobs 场景下**跳过**。
+
+### 9.5 logprobs 专用 emit 语义
+
+R3 的 `emit_start = max(routed_experts_prompt_start, ...)` 是「从 prompt_start 到最后一 token」。
+logprobs 的 PREDICTED_TOKEN 坐标（`logprob(token_i) <- forward(token_{i-1})`）需要一个不同的
+首 token sentinel + valid_len 处理，放在 `materialize_logprobs` 侧，不进 key（见方向 1 §10）。
+
+---
+
+## 10. 验收清单（以 #45635 为基线，增补 logprobs 项）
+
+- [ ] `InProcessArtifactStore`：定长 slot 幂等、`_evict_to_fit` fail-closed、`get_concatenated` 读自己写；
+- [ ] 引用计数：`retain`/`release` 正确驱动 `terminal_order`，KV block 释放后 artifact 可被淘汰；
+- [ ] `BackgroundArtifactStore`：coalesced batch、`_error` fail-closed、`close` 干净退出；
+- [ ] R3 端到端：capture → snapshot → D2H → buffer → publish → materialize 与 slot 直出逐元素一致；
+- [ ] prefix cache 命中：同 `block_hash` 的 R3 block 跨 request 复用（幂等 skip put）；
+- [ ] reset：generation 变化后 worker 清空 buffer + release 旧 key、旧 object 不被误读；
+- [ ] spec/MTP：`num_rejected` 截断后 rejected rows 不进 commit；
+- [ ] `_verify_artifact_compatibility`：V2/generate/MoE/prefix-cache 缺一即拒，PP/DCP/PCP/KV-connector 拒；
+- [ ] **（新增）logprobs 与 R3 分 store**：不同 `object_nbytes` 各得各的 arena，互不覆盖；
+- [ ] **（新增）logprobs key 前缀与 R3 不冲突**：同 `block_hash` 下两 field 各得各的 object；
+- [ ] **（新增）非 MoE 模型 + 仅 logprobs**：绕过 `bind_routed_experts_capturer` 的 raise 路径；
+- [ ] 关闭 artifact 开关零开销（`artifact_connector is None` 短路）。
+
+---
+
+## 11. 遗留（骨架阶段不解决）
+
+- **真·SHM / Mooncake / kvcc 后端**：当前只有 `InProcessArtifactStore`（匿名 mmap 单 owner）。真正的
+  `LocalSharedMemoryArtifactStore`（跨进程）与 mooncake 是下一阶段，`store.py` 是唯一挂点；届时
+  `get_concatenated`/`put(retain/release)` 契约需保持（引用计数语义可能退化为 no-op 或后端原生）。
+- **store 多 field 泛化**：logprobs 接入后若「每 field 一个 store」重复，再提炼 `dict[field, store]`
+  或把 `object_nbytes` 改成 per-key 尺寸索引（引入变长管理复杂度）。
+- **`RoutedExpertsManager`（slot buffer）退役**：capture 已切到 logical-object 发布，slot buffer 仅作
+  capture 中间态，逐步移除。
+- **`dp_sync_interval`**：review 讨论里提到的新 engine/CLI 选项（对应 commit `5968940`「Allow
+  intentional routed-expert output sync」），未在本文件已核实的 head 源码里定位到，待确认后再补。
+- **multi-rank writer**：单 owner 正确性后按 token/layer logical ranges 并行（见
+  [Prefix Artifact Multi-rank Writer 拓扑](Prefix Artifact Multi-rank Writer 拓扑.md)）。
