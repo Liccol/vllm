@@ -374,7 +374,9 @@ class Scheduler(SchedulerInterface):
             self.perf_metrics = ModelMetrics(vllm_config)
 
         self.artifact_connector = (
-            ArtifactSchedulerConnector()
+            ArtifactSchedulerConnector(
+                capture_logprobs=vllm_config.artifact_config.enable_return_logprobs
+            )
             if vllm_config.artifact_config.enabled
             else None
         )

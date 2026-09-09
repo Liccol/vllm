@@ -157,10 +157,12 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 for k, v in self.model_runner_output.prompt_logprobs_dict.items()
             }
             if pending_artifact_output is not None:
-                self.routed_experts = async_copy_to_np(
-                    pending_artifact_output.routed_experts
-                )
-                self.num_rejected = async_copy_to_np(sampler_output.num_rejected)
+                if pending_artifact_output.routed_experts is not None:
+                    self.routed_experts = async_copy_to_np(
+                        pending_artifact_output.routed_experts
+                    )
+                if sampler_output.num_rejected is not None:
+                    self.num_rejected = async_copy_to_np(sampler_output.num_rejected)
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
@@ -202,9 +204,10 @@ class AsyncOutput(AsyncModelRunnerOutput):
                         self.model_runner_output.req_ids,
                         pending.token_starts,
                         pending.query_start_loc,
-                        self.routed_experts,
+                        getattr(self, "routed_experts", None),
                         self.num_sampled_tokens_np,
-                        self.num_rejected,
+                        getattr(self, "num_rejected", None),
+                        logprobs=self.model_runner_output.logprobs,
                     )
                 )
             finally:

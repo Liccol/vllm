@@ -460,6 +460,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 enable_trace_replay=self.model_config.enable_trace_replay,
                 reasoning_config=self.vllm_config.reasoning_config,
                 return_sampling_mask=self.model_config.return_sampling_mask,
+                capture_logprobs_for_artifact=(
+                    self.vllm_config.artifact_config.enable_return_logprobs
+                ),
             )
             custom = self.model_state.custom_sampler(self.sampler)
 
@@ -1954,6 +1957,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.num_computed_tokens.gpu,
             self.req_states.prompt_len.np,
         )
+        if self.artifact_connector is not None and prompt_logprobs_dict:
+            # Replay prefix-cached prompt logprobs from the store and publish
+            # this prompt's blocks for future prefix hits.
+            prompt_lens = {
+                input_batch.req_ids[i]: int(
+                    self.req_states.prompt_len.np[input_batch.idx_mapping_np[i]]
+                )
+                for i in range(len(input_batch.req_ids))
+            }
+            self.artifact_connector.capture_prompt_logprobs(
+                prompt_logprobs_dict, prompt_lens
+            )
 
         # Prepare the model runner output.
         model_runner_output = ModelRunnerOutput(

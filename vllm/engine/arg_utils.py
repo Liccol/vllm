@@ -430,6 +430,9 @@ class EngineArgs:
     # Public compatibility argument. Canonical runtime state lives in
     # ArtifactConfig.
     enable_return_routed_experts: bool = False
+    # Public compatibility argument. Canonical runtime state lives in
+    # ArtifactConfig.
+    enable_return_logprobs: bool = False
     return_sampling_mask: bool = ModelConfig.return_sampling_mask
     model_weights: str = ModelConfig.model_weights
     served_model_name: str | list[str] | None = ModelConfig.served_model_name
@@ -790,6 +793,8 @@ class EngineArgs:
             self.artifact_config = ArtifactConfig(**self.artifact_config)
         if self.enable_return_routed_experts:
             self.artifact_config.enable_return_routed_experts = True
+        if self.enable_return_logprobs:
+            self.artifact_config.enable_return_logprobs = True
         if isinstance(self.mamba_config, dict):
             self.mamba_config = MambaConfig(**self.mamba_config)
         if isinstance(self.kernel_config, dict):
@@ -898,6 +903,10 @@ class EngineArgs:
         model_group.add_argument(
             "--enable-return-routed-experts",
             **artifact_kwargs["enable_return_routed_experts"],
+        )
+        model_group.add_argument(
+            "--enable-return-logprobs",
+            **artifact_kwargs["enable_return_logprobs"],
         )
         model_group.add_argument(
             "--return-sampling-mask",

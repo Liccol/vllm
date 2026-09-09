@@ -14,18 +14,24 @@ class ArtifactConfig:
     enable_return_routed_experts: bool = False
     """Capture and return routed-experts artifacts."""
 
+    enable_return_logprobs: bool = False
+    """Capture and replay logprobs artifacts keyed by KV block hash."""
+
     max_bytes: int | None = Field(default=None, gt=0)
     """LRU capacity, or ``None`` to derive it from the KV cache capacity."""
 
     @property
     def enabled(self) -> bool:
         """Whether any execution artifact is enabled."""
-        return self.enable_return_routed_experts
+        return self.enable_return_routed_experts or self.enable_return_logprobs
 
     def compute_hash(self) -> str:
         """Hash Artifact settings that alter the model forward graph."""
         from vllm.config.utils import hash_factors
 
         return hash_factors(
-            {"enable_return_routed_experts": self.enable_return_routed_experts}
+            {
+                "enable_return_routed_experts": self.enable_return_routed_experts,
+                "enable_return_logprobs": self.enable_return_logprobs,
+            }
         )

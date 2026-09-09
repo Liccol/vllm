@@ -43,10 +43,14 @@ class Sampler:
         enable_trace_replay: bool = False,
         reasoning_config: ReasoningConfig | None = None,
         return_sampling_mask: bool = False,
+        capture_logprobs_for_artifact: bool = False,
     ):
         self.logprobs_mode = logprobs_mode
         self.compute_nans = envs.VLLM_COMPUTE_NANS_IN_LOGITS  # False by default.
         self.use_fp64_gumbel = use_fp64_gumbel
+        # The artifact backend persists sampled-token logprobs even when no
+        # request asked for them, via the width-1 fast path.
+        self.capture_logprobs_for_artifact = capture_logprobs_for_artifact
 
         self.req_states = req_states
         self.sampling_states = SamplingStates(max_num_reqs, vocab_size)
@@ -115,6 +119,10 @@ class Sampler:
             else 0
         )
         if max_num_logprobs == NO_LOGPROBS and max_token_ids == 0:
+            if self.capture_logprobs_for_artifact:
+                # Artifact mode: still emit the width-1 sampled-token logprob
+                # so the block-keyed store can persist it (see __init__).
+                return 0, 0
             return None
         num_logprobs = max_num_logprobs if max_num_logprobs != NO_LOGPROBS else 0
         return num_logprobs, max_token_ids

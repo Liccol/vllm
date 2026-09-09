@@ -1014,7 +1014,8 @@ class VllmConfig:
 
     def _verify_artifact_compatibility(self) -> None:
         """Reject configurations unsupported by enabled artifacts."""
-        if not self.artifact_config.enabled:
+        artifact_config = self.artifact_config
+        if not artifact_config.enabled:
             return
         if not self.use_v2_model_runner:
             raise ValueError(
@@ -1023,8 +1024,14 @@ class VllmConfig:
             )
         if self.model_config.runner_type != "generate":
             raise ValueError("Artifact Connector only supports generate runners.")
-        if not self.model_config.is_moe:
-            raise ValueError("Artifact Connector only supports MoE models.")
+        if (
+            artifact_config.enable_return_routed_experts
+            and not self.model_config.is_moe
+        ):
+            raise ValueError(
+                "Artifact Connector routed-experts capture only supports MoE "
+                "models."
+            )
         if not self.cache_config.enable_prefix_caching:
             raise ValueError("Artifact Connector requires prefix caching.")
         if (

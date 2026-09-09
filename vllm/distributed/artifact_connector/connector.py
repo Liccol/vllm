@@ -33,6 +33,9 @@ class ArtifactConnectorMetadata:
     requests: dict[str, int]
     block_hashes: dict[str, PackedBlockHashes]
     finished_requests: tuple[str, ...]
+    # request_id -> logprobs capture width (1 + max requested logprobs), or
+    # None when logprobs capture is off or a request is not capturable.
+    logprobs_widths: dict[str, int] | None = None
 
 
 @dataclass
@@ -44,12 +47,13 @@ class ArtifactRequestOutput:
 class ArtifactSchedulerConnector:
     """Build worker metadata without owning artifact payloads or stores."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, capture_logprobs: bool = False) -> None:
         # Number of hashes already sent to the worker for each active request.
         self._sent_hash_counts: dict[str, int] = {}
         # Terminal events are delivered with the next connector metadata.
         self._finished_requests: dict[str, PackedBlockHashes | None] = {}
         self._generation = 0
+        self._capture_logprobs = capture_logprobs
 
     def build_connector_meta(
         self,
@@ -59,6 +63,7 @@ class ArtifactSchedulerConnector:
         """Build one step's incremental worker metadata."""
         scheduled_requests: dict[str, int] = {}
         block_hashes_by_request: dict[str, PackedBlockHashes] = {}
+        logprobs_widths: dict[str, int] = {}
         for request_id in scheduler_output.num_scheduled_tokens:
             num_sent = self._sent_hash_counts.setdefault(request_id, 0)
             request = requests[request_id]
@@ -71,6 +76,9 @@ class ArtifactSchedulerConnector:
                 request.sampling_params.routed_experts_prompt_start,
                 0 if request.num_output_tokens == 0 else request.num_tokens - 1,
             )
+            width = self._logprobs_width(request)
+            if width is not None:
+                logprobs_widths[request_id] = width
         # A settled token can complete a hash block after the next async schedule
         # was built. Send a hash-only update if the request was not rescheduled.
         if len(self._sent_hash_counts) != len(scheduled_requests):
@@ -96,7 +104,32 @@ class ArtifactSchedulerConnector:
             scheduled_requests,
             block_hashes_by_request,
             finished_requests,
+            logprobs_widths if self._capture_logprobs and logprobs_widths else None,
         )
+
+    @staticmethod
+    def _logprobs_width(request: Request) -> int | None:
+        """Effective logprobs capture width for one request.
+
+        The joined decode/prompt width (1 + max requested top-k) because one
+        KV block can hold both prompt and generated-token rows. ``None`` when
+        the request asks for all-logprob coverage (``-1``), which the fixed
+        block layout cannot capture.
+        """
+        assert request.sampling_params is not None
+        width = 1
+        for num in (
+            # getattr: the R3 test harness builds sampling_params as a bare
+            # SimpleNamespace without the logprobs fields.
+            getattr(request.sampling_params, "logprobs", None),
+            getattr(request.sampling_params, "prompt_logprobs", None),
+        ):
+            if num is None:
+                continue
+            if num == -1:
+                return None
+            width = max(width, num + 1)
+        return width
 
     def take_output(
         self,
