@@ -15,15 +15,16 @@ from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
-    from vllm.distributed.artifact_connector.connector import ArtifactRequestOutput
+    from vllm.distributed.aux_output_connector.connector import AuxRequestOutput
     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorWorkerMetadata
+    from vllm.distributed.ec_transfer.ec_connector.metrics import ECConnectorStats
     from vllm.distributed.kv_events import KVConnectorKVEvents
     from vllm.distributed.kv_transfer.kv_connector.v1.base import (
         KVConnectorWorkerMetadata,
     )
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 else:
-    ArtifactRequestOutput = object
+    AuxRequestOutput = object
     KVConnectorStats = object
     KVConnectorWorkerMetadata = object
     KVConnectorKVEvents = object
@@ -168,7 +169,6 @@ class LogprobsTensors(NamedTuple):
         num_positions: int, num_tokens_per_position: int
     ) -> "LogprobsTensors":
         """Create empty LogprobsTensors on CPU."""
-
         logprob_token_ids = torch.empty(
             (num_positions, num_tokens_per_position),
             dtype=torch.int32,
@@ -216,6 +216,9 @@ class KVConnectorOutput:
     # IDs of externally computed KV blocks that failed to load.
     # Requests referencing these blocks should be rescheduled to recompute them
     invalid_block_ids: set[int] = field(default_factory=set)
+    # Receive failures keyed by request identity. This remains unambiguous for
+    # hybrid/multi-pool cache layouts where numeric block IDs overlap.
+    failed_recving: set[str] = field(default_factory=set)
     # Configuration describing how many finished sending/receiving
     # notifications should be expected for each request. This allows
     # handshake-based connectors like Nixl to update the KVOutputAggregator.
@@ -230,6 +233,7 @@ class KVConnectorOutput:
             and not self.kv_connector_stats
             and not self.kv_cache_events
             and not self.invalid_block_ids
+            and not self.failed_recving
             and not self.kv_connector_worker_meta
         )
 
@@ -239,12 +243,14 @@ class ECConnectorOutput:
     # [mm_hash]
     finished_sending: set[str] | None = None
     finished_recving: set[str] | None = None
+    ec_connector_stats: "ECConnectorStats | None" = None
     ec_connector_worker_meta: ECConnectorWorkerMetadata | None = None
 
     def is_empty(self):
         return (
             not self.finished_sending
             and not self.finished_recving
+            and not self.ec_connector_stats
             and not self.ec_connector_worker_meta
         )
 
@@ -290,7 +296,7 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
-    artifact_connector_output: dict[str, ArtifactRequestOutput] | None = None
+    aux_output_connector_output: dict[str, AuxRequestOutput] | None = None
 
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
@@ -359,8 +365,7 @@ class DraftTokenIds:
 def make_empty_encoder_model_runner_output(
     scheduler_output: "SchedulerOutput",
 ) -> ModelRunnerOutput:
-    """
-    Create a ModelRunnerOutput stub that contains the correct
+    """Create a ModelRunnerOutput stub that contains the correct
     per-request bookkeeping but no generated data yet.
     """
     if not scheduler_output.num_scheduled_tokens:

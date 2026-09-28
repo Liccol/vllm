@@ -4,7 +4,6 @@ import types
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import numpy as np
 import pytest
 import torch
 
@@ -271,7 +270,7 @@ def test_routed_experts_capturer_narrows_snapshot(output_dtype):
 
 
 def test_routed_experts_capturer_dp_naive_concatenated_all_ranks():
-    """n == sum(num_tokens_dp): slice this rank's segment from concatenated topk."""
+    """N == sum(num_tokens_dp): slice this rank's segment from concatenated topk."""
     capturer = _capturer_with_buffer(dp_rank=1)
     num_tokens_dp = torch.tensor([2, 3], dtype=torch.int32)
     ctx = SimpleNamespace(
@@ -288,7 +287,7 @@ def test_routed_experts_capturer_dp_naive_concatenated_all_ranks():
 
 
 def test_routed_experts_capturer_dp_modular_local_tokens():
-    """n == token_num_per_dp: topk is already local to this DP rank."""
+    """N == token_num_per_dp: topk is already local to this DP rank."""
     capturer = _capturer_with_buffer(dp_rank=1)
     num_tokens_dp = torch.tensor([2, 3], dtype=torch.int32)
     ctx = SimpleNamespace(
@@ -358,55 +357,53 @@ def test_routed_experts_capturer_dp_unexpected_batch_raises():
     assert capturer.device_buffer[0, 0, 0].item() == -1
 
 
-def test_model_runner_initializes_capture(monkeypatch):
-    pytest.importorskip("vllm.vllm_flash_attn", exc_type=ImportError)
-    import vllm.v1.worker.gpu.model_runner as model_runner
+def test_get_aux_output_connector_passes_config(monkeypatch):
+    import vllm.distributed.aux_output_connector.worker as aux_output_worker
 
     connector = Mock()
     constructor = Mock(return_value=connector)
-    monkeypatch.setattr(model_runner, "ArtifactWorkerConnector", constructor)
-
-    runner = model_runner.GPUModelRunner.__new__(model_runner.GPUModelRunner)
-    runner.max_num_tokens = 32
-    runner.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(rank=0))
-    runner.model = Mock()
+    monkeypatch.setattr(aux_output_worker, "AuxOutputWorkerConnector", constructor)
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=32)
+    )
+    model = Mock()
     kv_cache_config = Mock()
 
-    runner.init_artifact_connector(kv_cache_config)
+    result = aux_output_worker.get_aux_output_connector(model, config, kv_cache_config)
 
     constructor.assert_called_once_with(
-        model=runner.model,
+        model=model,
         kv_cache_config=kv_cache_config,
-        max_num_batched_tokens=32,
-        vllm_config=runner.vllm_config,
+        vllm_config=config,
     )
-    assert runner.artifact_connector is connector
+    assert result is connector
 
 
-def test_artifact_worker_connector_binds_capture_on_non_output_rank(monkeypatch):
-    import vllm.distributed.artifact_connector.worker as artifact_worker
+def test_aux_output_worker_connector_binds_capture_on_non_output_rank(monkeypatch):
+    import vllm.distributed.aux_output_connector.worker as aux_output_worker
 
     capturer = Mock()
     constructor = Mock(return_value=capturer)
     bind = Mock()
-    monkeypatch.setattr(artifact_worker, "RoutedExpertsCapturer", constructor)
-    monkeypatch.setattr(artifact_worker, "bind_routed_experts_capturer", bind)
+    monkeypatch.setattr(aux_output_worker, "RoutedExpertsCapturer", constructor)
+    monkeypatch.setattr(aux_output_worker, "bind_routed_experts_capturer", bind)
     monkeypatch.setattr(
-        artifact_worker,
+        aux_output_worker,
         "get_tp_group",
         lambda: SimpleNamespace(is_first_rank=False, world_size=1),
     )
 
     config = SimpleNamespace(
-        artifact_config=SimpleNamespace(enable_return_routed_experts=True),
+        aux_output_config=SimpleNamespace(enable_return_routed_experts=True),
         kv_transfer_config=None,
+        max_concurrent_batches=2,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
     )
     model = Mock()
-    connector = artifact_worker.ArtifactWorkerConnector(
+    connector = aux_output_worker.AuxOutputWorkerConnector(
         vllm_config=config,
         model=model,
         kv_cache_config=SimpleNamespace(kv_cache_groups=[_full_attention_kv_group()]),
-        max_num_batched_tokens=32,
     )
 
     constructor.assert_called_once_with(
@@ -415,38 +412,38 @@ def test_artifact_worker_connector_binds_capture_on_non_output_rank(monkeypatch)
     )
     bind.assert_called_once_with(model, capturer)
     connector.begin_step(Mock())
-    assert connector.prepare_output([], np.array([]), np.array([])) is None
+    assert connector.prepare_output(Mock()) is None
     capturer.snapshot_routing_data.assert_not_called()
 
 
-def test_artifact_worker_connector_default_capacity(monkeypatch):
-    import vllm.distributed.artifact_connector.worker as artifact_worker
+def test_aux_output_worker_connector_default_capacity(monkeypatch):
+    import vllm.distributed.aux_output_connector.worker as aux_output_worker
 
     tp_group = SimpleNamespace(is_first_rank=True, world_size=1)
     store_constructor = Mock()
     background_store_constructor = Mock(side_effect=lambda store, **_: store)
     capturer = SimpleNamespace(shape_per_token=(2,), output_dtype_name="int32")
-    monkeypatch.setattr(artifact_worker, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(aux_output_worker, "get_tp_group", lambda: tp_group)
     monkeypatch.setattr(
-        artifact_worker, "RoutedExpertsCapturer", Mock(return_value=capturer)
+        aux_output_worker, "RoutedExpertsCapturer", Mock(return_value=capturer)
     )
-    monkeypatch.setattr(artifact_worker, "bind_routed_experts_capturer", Mock())
+    monkeypatch.setattr(aux_output_worker, "bind_routed_experts_capturer", Mock())
     monkeypatch.setattr(
-        artifact_worker,
+        aux_output_worker,
         "resolve_kv_cache_block_sizes",
         lambda *_: (32, 16),
     )
-    monkeypatch.setattr(artifact_worker, "InProcessArtifactStore", store_constructor)
+    monkeypatch.setattr(aux_output_worker, "BlockObjectStore", store_constructor)
     monkeypatch.setattr(
-        artifact_worker, "BackgroundArtifactStore", background_store_constructor
+        aux_output_worker, "BackgroundBlockObjectStore", background_store_constructor
     )
-    monkeypatch.setattr(artifact_worker, "RoutedExpertsArtifactBuffer", Mock())
+    monkeypatch.setattr(aux_output_worker, "RoutedExpertsBuffer", Mock())
 
     config = SimpleNamespace(
-        artifact_config=SimpleNamespace(max_bytes=None),
+        aux_output_config=SimpleNamespace(max_bytes=None),
         kv_transfer_config=None,
         cache_config=SimpleNamespace(enable_prefix_caching=True),
-        scheduler_config=SimpleNamespace(max_num_seqs=8),
+        scheduler_config=SimpleNamespace(max_num_seqs=8, max_num_batched_tokens=32),
         max_concurrent_batches=2,
     )
     kwargs = dict(
@@ -456,10 +453,9 @@ def test_artifact_worker_connector_default_capacity(monkeypatch):
             num_blocks=10,
             kv_cache_groups=[_full_attention_kv_group(MLAAttentionSpec)],
         ),
-        max_num_batched_tokens=32,
     )
 
-    artifact_worker.ArtifactWorkerConnector(**kwargs)
+    aux_output_worker.AuxOutputWorkerConnector(**kwargs)
     assert store_constructor.call_args.kwargs["max_bytes"] == 2560
     assert store_constructor.call_args.kwargs["object_nbytes"] == 128
     assert background_store_constructor.call_args.kwargs["max_pending_batches"] == 16
@@ -473,7 +469,7 @@ def test_v2_model_runner_accepts_routed_experts(monkeypatch):
             logits_processors=None,
             enable_prompt_embeds=False,
         ),
-        artifact_config=SimpleNamespace(enable_return_routed_experts=True),
+        aux_output_config=SimpleNamespace(enable_return_routed_experts=True),
         speculative_config=None,
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=1,
