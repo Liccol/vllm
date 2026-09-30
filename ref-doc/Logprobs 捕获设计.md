@@ -2,8 +2,8 @@
 
 日期：2026-09-07
 
-状态：设计稿，待评审。基于 [可落地设计 V3](Prefix Execution Artifact Store：可落地设计 V3.md)、
-[功能与并行兼容性](Prefix Artifact 功能与并行兼容性.md)、[PR Roadmap](Prefix Execution Artifact Store：PR Roadmap ZH.md)，
+状态：设计稿，待评审。基于 [可落地设计 V3](../reference-docs/Prefix%20Execution%20Artifact%20Store：可落地设计%20V3.md)、
+[功能与并行兼容性](../reference-docs/Prefix%20Artifact%20功能与并行兼容性.md)、[PR Roadmap](../reference-docs/Prefix%20Execution%20Artifact%20Store：PR%20Roadmap%20ZH.md)，
 以及 vLLM 三个既有 PR 的捕获范式推导而来。
 
 ---
@@ -21,7 +21,7 @@
 | [vllm#50721](https://github.com/vllm-project/vllm/pull/50721) | R3 迁移 MRV2：`ModelRunnerOutput.routed_experts` 字段 + 快照封装 | MRV2 异步输出路径的接入方式 |
 | [vllm#49555](https://github.com/vllm-project/vllm/pull/49555) | indexer top-k（DSA）返回：镜像 `--enable-return-routed-experts` 的第二个 token-wise artifact | 第二字段如何复用 R3 管道、prefill/decode/spec 三路切片收敛 |
 
-Roadmap 中 logprobs 的定位（[PR Roadmap ZH](Prefix Execution Artifact Store：PR Roadmap ZH.md)）：
+Roadmap 中 logprobs 的定位（[PR Roadmap ZH](../reference-docs/Prefix%20Execution%20Artifact%20Store：PR%20Roadmap%20ZH.md)）：
 阶段 1（Artifact Connector + SHM）Token-wise 里的 `Logprobs @刘荣`；S2（Mooncake）迁移 `Logprobs`。
 
 ---
@@ -41,7 +41,7 @@ logprobs 在 vLLM 里本来就是 sampler 的既有输出。** 因此 decode 阶
 
 ### 2.1 语义坐标（遵守既有文档）
 
-[可落地设计 V3 §5.2](Prefix Execution Artifact Store：可落地设计 V3.md) 已定死：
+[可落地设计 V3 §5.2](../reference-docs/Prefix%20Execution%20Artifact%20Store：可落地设计%20V3.md) 已定死：
 
 ```text
 KV / R3 / DSA of token_i  <- forward(token_i)
@@ -76,7 +76,7 @@ KV block k 覆盖 executed tokens [kB, (k+1)B)
 好处：
 
 - logprob full-block 的 `kv_block_hash` 与 R3 完全一致，prefix 复用时不产生三 field 边界错位；
-- `block_key = H(schema, model_namespace, field="logprobs", dtype, shape_per_token, raw/processed_mode, artifact_block_size, kv_block_hash)` 可直接套用 [§5.3](Prefix Execution Artifact Store：可落地设计 V3.md) 的 key 公式；
+- `block_key = H(schema, model_namespace, field="logprobs", dtype, shape_per_token, raw/processed_mode, artifact_block_size, kv_block_hash)` 可直接套用 [§5.3](../reference-docs/Prefix%20Execution%20Artifact%20Store：可落地设计%20V3.md) 的 key 公式；
 - 冷/热路径拼接时不用做 +1/-1 位移。
 
 代价：首个 block 恒有一个 sentinel 位置。若后续证明 sentinel 破坏消费者契约，再回退到
@@ -94,7 +94,7 @@ num_logprob_blocks = ceil(L_logprob / B)      # 与 R3 同公式，仅覆盖 tok
 ```
 
 finalize 时两个 field 各自派生 ordered key list，共享同一个 completion barrier：
-任一 required field 失败，request 不返回任何 production handle（[§1.4](Prefix Execution Artifact Store：可落地设计 V3.md)）。
+任一 required field 失败，request 不返回任何 production handle（[§1.4](../reference-docs/Prefix%20Execution%20Artifact%20Store：可落地设计%20V3.md)）。
 
 ---
 
@@ -136,7 +136,7 @@ forward(chunk) -> hidden_states
 这正解释了本项目要做 logprobs artifact 的动机：**命中前缀的 prompt logprobs 必须作为 `PREFIX_BLOCK`
 artifact 持久化复用，否则跨 request 复用前缀时拿不到 hidden_states 去重算。**
 
-分工边界（[§13](Prefix Execution Artifact Store：可落地设计 V3.md)）不变：boundary hidden-state 的
+分工边界（[§13](../reference-docs/Prefix%20Execution%20Artifact%20Store：可落地设计%20V3.md)）不变：boundary hidden-state 的
 capture/restore 留在 sampler 路径；ArtifactConnector 只负责把 sampler 最终算出的 logprobs 存起来。
 
 仍在 sampler 侧、不属于 ArtifactConnector 的机制：`resumed_after_prompt`（preemption 恢复后跳过重算）、
@@ -146,7 +146,7 @@ capture/restore 留在 sampler 路径；ArtifactConnector 只负责把 sampler �
 
 参考 [vllm#45635](https://github.com/vllm-project/vllm/pull/45635) 的
 `process_output(req_ids, …, num_sampled_tokens_np, num_rejected)` 与
-[功能与并行兼容性 §5.2](Prefix Artifact 功能与并行兼容性.md)：
+[功能与并行兼容性 §5.2](../reference-docs/Prefix%20Artifact%20功能与并行兼容性.md)：
 
 ```text
 draft/verification capture
@@ -184,7 +184,7 @@ stop-trim 后、async in-flight 的行同样不得进入 committed range。
 
 ### 4.2 raw / processed mode
 
-[§5.2](Prefix Execution Artifact Store：可落地设计 V3.md) 要求 logprobs profile 区分
+[§5.2](../reference-docs/Prefix%20Execution%20Artifact%20Store：可落地设计%20V3.md) 要求 logprobs profile 区分
 **raw / processed mode**：
 
 - raw = 采样器原始 logprob；
@@ -194,7 +194,7 @@ stop-trim 后、async in-flight 的行同样不得进入 committed range。
 
 ### 4.3 object envelope
 
-复用 [§5.5](Prefix Execution Artifact Store：可落地设计 V3.md) 的统一逻辑 header，`field` 改为
+复用 [§5.5](../reference-docs/Prefix%20Execution%20Artifact%20Store：可落地设计%20V3.md) 的统一逻辑 header，`field` 改为
 `"logprobs"`，`dtype` 为 `|f4`（float32），`valid_len` 为 block 内有效 logprob 行数
 （首 block 因 sentinel 减 1）。
 
@@ -216,16 +216,16 @@ Sampler 输出 (logprobs / logprob_token_ids)
 必须遵守的既有约束：
 
 - **不建独立 `prompt_logprobs.py`**、不建 backend-specific materializer、不建 Codec 继承树或
-  manager hierarchy（[§13](Prefix Execution Artifact Store：可落地设计 V3.md)）；
+  manager hierarchy（[§13](../reference-docs/Prefix%20Execution%20Artifact%20Store：可落地设计%20V3.md)）；
 - logprobs 是 `PREFIX_BLOCK` 下「一个统一 `logprobs` field」，开 `prompt_logprobs` 只是给该
-  field 加 prompt coverage，**不产生第二种 artifact**（[§1.4](Prefix Execution Artifact Store：可落地设计 V3.md)）；
+  field 加 prompt coverage，**不产生第二种 artifact**（[§1.4](../reference-docs/Prefix%20Execution%20Artifact%20Store：可落地设计%20V3.md)）；
 - 启用 artifact backend 后 logprobs 也从 backend 读取，HTTP 不再重复返回完整 logprobs value
-  （[§1.4](Prefix Execution Artifact Store：可落地设计 V3.md)）；
+  （[§1.4](../reference-docs/Prefix%20Execution%20Artifact%20Store：可落地设计%20V3.md)）；
 - 命中条件升级为三态原子 `KV ready AND R3 ready AND prompt-logprobs ready`，**不允许 KV 命中
   但 prompt-logprobs 不命中的降级**，视为 connector miss 或一致性错误
-  （[功能与并行兼容性 §5.1](Prefix Artifact 功能与并行兼容性.md)）；
+  （[功能与并行兼容性 §5.1](../reference-docs/Prefix%20Artifact%20功能与并行兼容性.md)）；
 - `fields.py` 中 logprobs 是同一 Core 的 field descriptor 配置，不建立 per-field Manager/生命周期
-  （[§13](Prefix Execution Artifact Store：可落地设计 V3.md)）。
+  （[§13](../reference-docs/Prefix%20Execution%20Artifact%20Store：可落地设计%20V3.md)）。
 
 ---
 
@@ -248,7 +248,7 @@ Sampler 输出 (logprobs / logprob_token_ids)
 - decode 冷启动：logprob 与 `logprobs=k` 的 top-k 逐项一致；
 - prompt 首 token 无 logprob、sentinel 处理正确；
 - prefix full/partial hit 时 boundary restore 后 logprob 与冷启动 exact
-  （对齐 [§11.3](Prefix Execution Artifact Store：可落地设计 V3.md) 的 Prompt Logprobs 验收）；
+  （对齐 [§11.3](../reference-docs/Prefix%20Execution%20Artifact%20Store：可落地设计%20V3.md) 的 Prompt Logprobs 验收）；
 - speculative：rejected token 的 logprob 不进入 commit；
 - `PREDICTED_TOKEN` 语义下 full-block key 派生与拼接正确（首 block sentinel 不进 payload）；
 - 三态原子命中（KV + R3 + logprobs）缺一 fail closed；
@@ -283,7 +283,7 @@ Sampler 输出 (logprobs / logprob_token_ids)
 | R3 捕获范式（参照） | `vllm/model_executor/layers/fused_moe/routed_experts_capturer.py` | `RoutedExpertsCapturer`, `RoutedExpertsManager` |
 
 **现状提醒**：本 fork 尚未合入 `artifact_connector` 目录（无 `ArtifactConnector`/`ArtifactRequestCore`），
-当前只有 R3 的 capture baseline。logprobs 需在 R3 baseline 之上，按 [PR Roadmap 阶段 1](Prefix Execution Artifact Store：PR Roadmap ZH.md)
+当前只有 R3 的 capture baseline。logprobs 需在 R3 baseline 之上，按 [PR Roadmap 阶段 1](../reference-docs/Prefix%20Execution%20Artifact%20Store：PR%20Roadmap%20ZH.md)
 补出「统一 Core + SHM」后再接入本字段。
 
 ---

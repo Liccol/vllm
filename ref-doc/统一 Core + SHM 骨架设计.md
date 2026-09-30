@@ -428,4 +428,4 @@ logprobs 的 PREDICTED_TOKEN 坐标（`logprob(token_i) <- forward(token_{i-1})`
 - **`dp_sync_interval`**：review 讨论里提到的新 engine/CLI 选项（对应 commit `5968940`「Allow
   intentional routed-expert output sync」），未在本文件已核实的 head 源码里定位到，待确认后再补。
 - **multi-rank writer**：单 owner 正确性后按 token/layer logical ranges 并行（见
-  [Prefix Artifact Multi-rank Writer 拓扑](Prefix Artifact Multi-rank Writer 拓扑.md)）。
+  [Prefix Artifact Multi-rank Writer 拓扑](../reference-docs/Prefix%20Artifact%20Multi-rank%20Writer%20拓扑.md)）。
